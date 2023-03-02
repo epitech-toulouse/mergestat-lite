@@ -5,6 +5,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"github.com/mattn/go-sqlite3"
+	_ "github.com/mattn/go-sqlite3"
+	"regexp"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -39,7 +42,17 @@ type CommitSummary struct {
 // will exclude empty commits from the resultset. This makes sense, because empty commits won't have
 // changed any files in the specified pattern (they won't have changed any files at all).
 const preloadCommitsWithFilePathPatternSQL = `
-CREATE TABLE preloaded_commit_stats AS SELECT * FROM commits LEFT JOIN stats('', commits.hash) WHERE file_path LIKE $file_path AND author_when > date($start, $start_mod) AND author_when < date($end, $end_mod);
+CREATE TABLE preloaded_commit_stats AS SELECT * FROM commits LEFT JOIN stats('', commits.hash) WHERE REGEXP($file_path, file_path) AND author_when > date($start, $start_mod) AND author_when < date($end, $end_mod);
+CREATE TABLE preloaded_commits AS SELECT hash, author_name, author_email, author_when, parents FROM preloaded_commit_stats GROUP BY hash;
+`
+
+const preloadCommitsWithNotFilePathPatternSQL = `
+CREATE TABLE preloaded_commit_stats AS SELECT * FROM commits LEFT JOIN stats('', commits.hash) WHERE NOT REGEXP($file_exclude_path, file_path) AND author_when > date($start, $start_mod) AND author_when < date($end, $end_mod);
+CREATE TABLE preloaded_commits AS SELECT hash, author_name, author_email, author_when, parents FROM preloaded_commit_stats GROUP BY hash;
+`
+
+const preloadCommitsWithAndWithNotFilePathPatternSQL = `
+CREATE TABLE preloaded_commit_stats AS SELECT * FROM commits LEFT JOIN stats('', commits.hash) WHERE REGEXP($file_path, file_path) AND NOT REGEXP($file_exclude_path, file_path) AND author_when > date($start, $start_mod) AND author_when < date($end, $end_mod);
 CREATE TABLE preloaded_commits AS SELECT hash, author_name, author_email, author_when, parents FROM preloaded_commit_stats GROUP BY hash;
 `
 
@@ -92,6 +105,7 @@ type dateFilter struct {
 type TermUI struct {
 	db                    *sqlx.DB
 	pathPattern           string
+	pathNotPattern        string
 	dateFilterStart       dateFilter
 	dateFilterEnd         dateFilter
 	err                   error
@@ -101,14 +115,24 @@ type TermUI struct {
 	commitAuthorSummaries *[]*CommitAuthorSummary
 }
 
-func NewTermUI(pathPattern, dateFilterStart, dateFilterEnd string) (*TermUI, error) {
+func NewTermUI(pathPattern, pathNotPattern, dateFilterStart, dateFilterEnd string) (*TermUI, error) {
 	var db *sqlx.DB
 	var err error
-	if db, err = sqlx.Open("sqlite3", "file::memory:?cache=shared"); err != nil {
+
+	sql.Register("sqlite3_with_regexp", &sqlite3.SQLiteDriver{
+		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
+			if err := conn.RegisterFunc("REGEXP", func(re, s string) (bool, error) {
+				return regexp.MatchString(re, s)
+			}, true); err != nil {
+				return err
+			}
+			return nil
+		},
+	})
+	if db, err = sqlx.Open("sqlite3_with_regexp", "file::memory:?cache=shared"); err != nil {
 		return nil, fmt.Errorf("failed to initialize database connection: %v", err)
 	}
 	db.SetMaxOpenConns(1)
-
 	s := spinner.New()
 	s.Spinner = spinner.Spinner{
 		Frames: []string{".", "..", "..."},
@@ -141,6 +165,7 @@ func NewTermUI(pathPattern, dateFilterStart, dateFilterEnd string) (*TermUI, err
 	return &TermUI{
 		db:              db,
 		pathPattern:     pathPattern,
+		pathNotPattern:  pathNotPattern,
 		spinner:         s,
 		dateFilterStart: dateFilter{date: start, mod: startMod},
 		dateFilterEnd:   dateFilter{date: end, mod: endMod},
@@ -165,9 +190,16 @@ func (t *TermUI) preloadCommits() tea.Msg {
 		sql.Named("end_mod", t.dateFilterEnd.mod),
 	}
 
-	if t.pathPattern != "" {
+	if t.pathPattern != "" && t.pathNotPattern != "" {
+		preloadCommitsSQL = preloadCommitsWithAndWithNotFilePathPatternSQL
+		args = append(args, sql.Named("file_path", t.pathPattern))
+		args = append(args, sql.Named("file_exclude_path", t.pathNotPattern))
+	} else if t.pathPattern != "" {
 		preloadCommitsSQL = preloadCommitsWithFilePathPatternSQL
 		args = append(args, sql.Named("file_path", t.pathPattern))
+	} else if t.pathNotPattern != "" {
+		preloadCommitsSQL = preloadCommitsWithNotFilePathPatternSQL
+		args = append(args, sql.Named("file_exclude_path", t.pathNotPattern))
 	}
 	if _, err := t.db.Exec(preloadCommitsSQL, args...); err != nil {
 		return err
